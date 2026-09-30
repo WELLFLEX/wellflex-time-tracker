@@ -578,3 +578,55 @@ export async function sendPasswordResetEmail(params: {
     return { success: false, error: error?.message || 'Failed to send password reset email' }
   }
 }
+
+/**
+ * Send a team invitation through WeTrack's own SMTP. The action URL is hosted
+ * by the app so email scanners do not hit Supabase's one-time /verify endpoint.
+ */
+export async function sendTeamInviteEmail(params: {
+  to: string
+  inviteUrl: string
+  teamName?: string | null
+  role: 'MEMBER' | 'MANAGER' | 'ADMIN'
+}): Promise<AuthEmailResult> {
+  const transporter = getEmailTransporter()
+  if (!transporter) {
+    console.error('[EMAIL] SMTP not configured; cannot send team invitation')
+    return { success: false, error: 'SMTP not configured' }
+  }
+
+  const fromEmail = process.env.SMTP_FROM_EMAIL || 'wetrack <noreply@wellflex.co>'
+  const teamLabel = params.teamName ? ` to ${params.teamName}` : ''
+  const roleLabel =
+    params.role === 'ADMIN' ? 'an administrator' :
+    params.role === 'MANAGER' ? 'a manager' :
+    'a member'
+
+  const html = buildAuthEmailHtml({
+    heading: 'You are invited to WeTrack',
+    intro: `You have been invited${teamLabel} as ${roleLabel}. Click the button below to review and accept the invitation.`,
+    buttonLabel: 'Review invitation',
+    actionUrl: params.inviteUrl,
+    footerNote: 'For your security, the invitation is completed only after you click Accept on the WeTrack page. If you were not expecting this invitation, you can ignore this email.',
+  })
+
+  try {
+    const result = await transporter.sendMail({
+      from: fromEmail,
+      to: params.to,
+      subject: params.teamName
+        ? `You are invited to ${params.teamName} on WeTrack`
+        : 'You are invited to WeTrack',
+      html,
+    })
+    console.log('[EMAIL] ✅ Team invitation sent', { to: params.to, messageId: result.messageId })
+    return { success: true }
+  } catch (error: any) {
+    console.error('[EMAIL] ❌ Failed to send team invitation:', {
+      error: error?.message || error,
+      to: params.to,
+    })
+    return { success: false, error: error?.message || 'Failed to send team invitation' }
+  }
+}
+

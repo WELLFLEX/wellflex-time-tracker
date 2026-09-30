@@ -3,6 +3,8 @@ import { createServiceSupabaseClient } from '@/lib/supabase/server'
 import { getUserFromRequest } from '@/lib/auth/get-user'
 import { isSuperAdmin } from '@/lib/auth/superadmin'
 import { canAssignRole } from '@/lib/auth/roles'
+import { getAppUrl } from '@/lib/utils/app-url'
+import { sendTeamInviteEmail } from '@/lib/utils/email'
 import { z } from 'zod'
 
 const inviteSchema = z.object({
@@ -65,7 +67,9 @@ export async function POST(request: NextRequest) {
     // If not in public.users, check auth.users and create record
     if (!existingUser) {
       const { data: authUsers } = await supabase.auth.admin.listUsers()
-      const authUser = authUsers?.users.find((u: any) => u.email === email)
+      const authUser = authUsers?.users.find(
+        (u: any) => u.email?.toLowerCase() === email.toLowerCase()
+      )
       
       if (authUser) {
         // User exists in auth but not in public.users - create the record
@@ -131,30 +135,86 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    // User doesn't exist - send invite via Supabase Auth
-    const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
+    // New users get an app-owned invitation. generateLink mints the one-time
+    // Supabase token without sending Supabase's default email.
+    const { data: inviteData, error: inviteError } = await supabase.auth.admin.generateLink({
+      type: 'invite',
       email,
+    } as any)
+
+    const invitedUser = (inviteData as any)?.user
+    const hashedToken = (inviteData as any)?.properties?.hashed_token
+
+    if (inviteError || !invitedUser || !hashedToken) {
+      return NextResponse.json(
+        { error: inviteError?.message || 'Could not create invitation' },
+        { status: 400 }
+      )
+    }
+
+    const rollbackInvitedUser = async () => {
+      const { error: cleanupError } = await supabase.auth.admin.deleteUser(invitedUser.id)
+      if (cleanupError) {
+        console.error('[INVITES] Failed to roll back invited user:', cleanupError.message)
+      }
+    }
+
+    // Authorization-sensitive invite state belongs in app_metadata because users
+    // cannot edit it themselves. The browser never gets to choose team_id/role.
+    const pendingTeamInvite = {
+      team_id,
+      role,
+      invited_by: user.id,
+      issued_at: new Date().toISOString(),
+    }
+    const { error: metadataError } = await supabase.auth.admin.updateUserById(
+      invitedUser.id,
       {
-        data: {
-          team_id,
-          role,
-          invited_by: user.id,
+        app_metadata: {
+          ...(invitedUser.app_metadata || {}),
+          pending_team_invite: pendingTeamInvite,
         },
-        redirectTo: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/auth/accept-invite`,
       }
     )
 
-    if (inviteError) {
+    if (metadataError) {
+      await rollbackInvitedUser()
       return NextResponse.json(
-        { error: inviteError.message },
-        { status: 400 }
+        { error: 'Could not secure invitation metadata. Please try again.' },
+        { status: 500 }
+      )
+    }
+
+    const { data: team } = await supabase
+      .from('teams')
+      .select('name')
+      .eq('id', team_id)
+      .maybeSingle()
+
+    // The email points to our app, not /auth/v1/verify. The acceptance page
+    // requires an explicit button click before consuming the one-time token,
+    // which also protects against email-provider link prefetching.
+    const inviteUrl = `${getAppUrl()}/auth/accept-invite?token_hash=${encodeURIComponent(hashedToken)}&type=invite`
+    const sendResult = await sendTeamInviteEmail({
+      to: email,
+      inviteUrl,
+      teamName: (team as { name?: string } | null)?.name || null,
+      role,
+    })
+
+    if (!sendResult.success) {
+      console.error('[INVITES] Invitation email failed to send:', sendResult.error)
+      await rollbackInvitedUser()
+      return NextResponse.json(
+        { error: 'We could not send the invitation email. Please try again.' },
+        { status: 502 }
       )
     }
 
     return NextResponse.json({ 
       success: true,
       message: 'Invite sent successfully',
-      user: inviteData.user 
+      user: invitedUser,
     })
   } catch (error) {
     if (error instanceof z.ZodError) {
@@ -163,6 +223,7 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       )
     }
+    console.error('[INVITES] Failed to send invitation:', error)
     return NextResponse.json(
       { error: 'Internal server error' },
       { status: 500 }
