@@ -58,9 +58,8 @@ so make sure it is set in Vercel and **redeploy** after changing it.
   (dashboard: https://supabase.com/dashboard/project/xhrdwouybvuzvbkhbjhk).
 - `SUPABASE_SERVICE_ROLE_KEY` must be set (server-side only) — `generateLink`
   requires it.
-- No email-template or URL changes are required for signup/reset. (Custom SMTP in
-  Supabase Auth is only needed for flows Supabase still sends itself, e.g. team
-  invites — see note below.)
+- No email-template or URL changes are required for signup/reset/team invites.
+  All three flows now use app-owned links and the app's SMTP transport.
 
 ## Testing
 
@@ -73,8 +72,20 @@ so make sure it is set in Vercel and **redeploy** after changing it.
    `https://tracker.wellflex.co/reset-password?...`, and after setting a new password
    you're sent to `/login`.
 
-## Note: invites are still Supabase-sent
+## Team invites
 
-Team invites (`/api/invites`) currently use Supabase's invite email. If you want
-those on the app domain too, migrate them to the same `generateLink` + SMTP pattern
-(`type: 'invite'` → `/auth/accept-invite?token_hash=…&type=invite`).
+Team invites (`/api/invites`) use the same app-owned pattern:
+
+1. `auth.admin.generateLink({ type: 'invite' })` creates the one-time token without
+   sending Supabase's default email.
+2. The team/role assignment is stored temporarily in protected `app_metadata`.
+3. WeTrack sends an SMTP email whose link points to
+   `/auth/accept-invite?token_hash=…&type=invite`.
+4. Opening the page does **not** consume the token. The user must explicitly click
+   **Accept invitation**, which calls `verifyOtp` in the browser.
+5. The authenticated browser then calls `POST /api/invites/accept`; that route
+   assigns the team/role server-side from `app_metadata` and clears the pending
+   invite metadata.
+
+The explicit confirmation step is intentional: email-security scanners can safely
+inspect the app-hosted URL without consuming Supabase's one-time auth token.
